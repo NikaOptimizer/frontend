@@ -5,16 +5,19 @@ import {
   CrosshairMode,
   LineSeries,
   createChart,
-  createSeriesMarkers,
   type IChartApi,
   type ISeriesApi,
-  type ISeriesMarkersPluginApi,
-  type SeriesMarker,
   type Time,
 } from 'lightweight-charts'
-import { Code2, Eraser, MousePointer2, Plus, SkipBack, SkipForward } from 'lucide-react'
+import { Code2, Plus, SkipBack, SkipForward, Trash2 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
+import { toBars } from '@/components/chart/drawing/core/time-index'
+import { DrawingRibbon } from '@/components/chart/drawing/react/drawing-ribbon'
+import { DrawingSettingsDialog } from '@/components/chart/drawing/react/drawing-settings-dialog'
+import { DrawingToolbar } from '@/components/chart/drawing/react/drawing-toolbar'
+import { TOOL_LABELS } from '@/components/chart/drawing/react/tool-icons'
+import { attachDrawingTools, useDrawingController } from '@/components/chart/drawing/react/use-drawing-tools'
 
 type Candle = {
   time: Time
@@ -30,77 +33,72 @@ type Indicator = {
   color: string
 }
 
-type ChartShape = {
-  id: string
-  time: Time
-  label: string
-  color: string
-}
-
 type CandlestickWorkbenchProps = {
   strategyId: string
   symbol: string
+  provider: string
+  period: string
 }
 
 const timeframes = ['1m', '5m', '15m', '1h', '4h', '1d']
+const timeframeSeconds: Record<string, number> = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 }
 const indicatorColors = ['#f6b73c', '#7dd3fc', '#a78bfa', '#34d399', '#fb7185']
 
-export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenchProps) {
+export function CandlestickWorkbench({ strategyId, symbol, provider, period }: CandlestickWorkbenchProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
-  const markerApiRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
   const indicatorSeriesRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
-  const isDrawingRef = useRef(false)
+  const { controller: drawings, snapshot: drawingState } = useDrawingController(strategyId, provider, symbol)
 
   const [timeframe, setTimeframe] = useState(timeframes[2])
   const [candles, setCandles] = useState<Candle[]>([])
-  const [fetchState, setFetchState] = useState<'idle' | 'loading' | 'fallback'>('idle')
+  const [fetchState, setFetchState] = useState<'idle' | 'loading' | 'error' | 'empty'>('loading')
+  const [fetchError, setFetchError] = useState('')
+  const [refresh, setRefresh] = useState(0)
   const [indicators, setIndicators] = useState<Indicator[]>([
     { id: 'sma-20', name: 'SMA 20', color: indicatorColors[0] },
   ])
   const [indicatorName, setIndicatorName] = useState('EMA 50')
-  const [isDrawing, setIsDrawing] = useState(false)
-  const [shapes, setShapes] = useState<ChartShape[]>(() => readPersistedShapes(strategyId, symbol))
   const [isCustomEditorOpen, setIsCustomEditorOpen] = useState(false)
   const [customIndicatorCode, setCustomIndicatorCode] = useState(
     "def custom_indicator(candles):\n    '''Return a list of values aligned with candles.'''\n    return [candle['close'] for candle in candles]\n",
   )
 
   const candleEndpoint = useMemo(() => {
-    const params = new URLSearchParams({ symbol, timeframe, strategy_id: strategyId })
+    const params = new URLSearchParams({ symbol, provider, timeframe, period, limit: '500' })
     return `/api/candles/?${params.toString()}`
-  }, [strategyId, symbol, timeframe])
-
-  useEffect(() => {
-    isDrawingRef.current = isDrawing
-  }, [isDrawing])
+  }, [symbol, provider, timeframe, period])
 
   useEffect(() => {
     let ignore = false
+    const controller = new AbortController()
 
     async function loadCandles() {
       setFetchState('loading')
+      setCandles([])
+      setFetchError('')
 
       try {
-        const response = await fetch(candleEndpoint)
+        const response = await fetch(candleEndpoint, { signal: controller.signal })
         if (!response.ok) {
           throw new Error(`Candle request failed with status ${response.status}`)
         }
 
         const payload = (await response.json()) as { candles?: Candle[] }
-        if (!payload.candles?.length) {
-          throw new Error('Candle response did not include candles')
+        if (!Array.isArray(payload.candles)) {
+          throw new Error('Invalid candle response')
         }
 
         if (!ignore) {
           setCandles(payload.candles)
-          setFetchState('idle')
+          setFetchState(payload.candles.length ? 'idle' : 'empty')
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
-          setCandles(generatePlaceholderCandles(symbol, timeframe))
-          setFetchState('fallback')
+          setCandles([])
+          setFetchError(error instanceof Error ? error.message : 'Unable to load candles')
+          setFetchState('error')
         }
       }
     }
@@ -109,8 +107,9 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
 
     return () => {
       ignore = true
+      controller.abort()
     }
-  }, [candleEndpoint, symbol, timeframe])
+  }, [candleEndpoint, refresh])
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -146,54 +145,30 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
       wickDownColor: '#fca5a5',
     })
 
-    const markers = createSeriesMarkers(candleSeries, [])
     const indicatorSeries = indicatorSeriesRef.current
+    const detachDrawings = attachDrawingTools(drawings, chart, candleSeries)
 
     chartRef.current = chart
     candleSeriesRef.current = candleSeries
-    markerApiRef.current = markers
-
-    const handleClick = (param: { time?: Time }) => {
-      if (!isDrawingRef.current || param.time === undefined) {
-        return
-      }
-
-      const shape: ChartShape = {
-        id: `${Date.now()}`,
-        time: param.time,
-        label: 'Rule marker',
-        color: '#f6b73c',
-      }
-
-      setShapes((currentShapes) => [...currentShapes, shape])
-      setIsDrawing(false)
-    }
-
-    chart.subscribeClick(handleClick)
 
     return () => {
-      chart.unsubscribeClick(handleClick)
+      detachDrawings()
       indicatorSeries.clear()
       chart.remove()
       chartRef.current = null
       candleSeriesRef.current = null
-      markerApiRef.current = null
     }
-  }, [])
+  }, [drawings])
 
   useEffect(() => {
     candleSeriesRef.current?.setData(candles)
     chartRef.current?.timeScale().fitContent()
-  }, [candles])
-
-  useEffect(() => {
-    markerApiRef.current?.setMarkers(shapes.map(shapeToMarker))
-    localStorage.setItem(shapeStorageKey(strategyId, symbol), JSON.stringify(shapes))
-  }, [shapes, strategyId, symbol])
+    drawings.setBars(toBars(candles, timeframeSeconds[timeframe]))
+  }, [candles, drawings, timeframe])
 
   useEffect(() => {
     const chart = chartRef.current
-    if (!chart || candles.length === 0) {
+    if (!chart) {
       return
     }
 
@@ -201,6 +176,7 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
       chart.removeSeries(series)
     }
     indicatorSeriesRef.current.clear()
+    if (candles.length === 0) return
 
     indicators.forEach((indicator) => {
       const series = chart.addSeries(LineSeries, {
@@ -239,6 +215,7 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
     <div className="space-y-5">
       <div className="app-chart-toolbar">
         <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="outline" size="sm" className="app-secondary-button" disabled={fetchState === 'loading'} onClick={() => setRefresh((value) => value + 1)}>Refresh candles</Button>
           {timeframes.map((item) => (
             <button
               key={item}
@@ -260,23 +237,22 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
             <SkipForward aria-hidden="true" />
             Forward
           </Button>
-          <Button type="button" variant="outline" size="sm" onClick={() => setIsDrawing(true)} className="app-secondary-button">
-            <MousePointer2 aria-hidden="true" />
-            {isDrawing ? 'Click chart...' : 'Draw marker'}
-          </Button>
-          <Button type="button" variant="outline" size="sm" onClick={() => setShapes([])} className="app-secondary-button">
-            <Eraser aria-hidden="true" />
-            Clear shapes
-          </Button>
         </div>
       </div>
 
       <div className="app-chart-shell">
-        <div ref={containerRef} className="app-lightweight-chart" />
-        <div className="app-chart-fetch-state">
+        <div className="drawing-chart-row">
+          <DrawingRibbon controller={drawings} snapshot={drawingState} />
+          <div className="drawing-chart-area">
+            <div ref={containerRef} className="app-lightweight-chart" />
+            <DrawingToolbar controller={drawings} snapshot={drawingState} />
+          </div>
+        </div>
+        <div className="app-chart-fetch-state" role="status">
           {fetchState === 'loading' && 'Loading candles from backend...'}
-          {fetchState === 'fallback' && `Using placeholder candles until ${candleEndpoint} is implemented.`}
-          {fetchState === 'idle' && `Candles loaded from ${candleEndpoint}`}
+          {fetchState === 'error' && `${fetchError}. Use Refresh candles to retry.`}
+          {fetchState === 'empty' && 'No candles available for this selection.'}
+          {fetchState === 'idle' && `${candles.length} stored candles loaded. Showing up to the latest 500 bars in the selected period.`}
         </div>
       </div>
 
@@ -322,25 +298,32 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
         </div>
 
         <div className="app-chart-control-panel">
-          <p className="app-eyebrow">Persistent shapes</p>
+          <p className="app-eyebrow">Drawings</p>
           <h3 className="font-semibold text-white">Chart annotations</h3>
           <p className="app-muted mt-2 text-sm">
-            Markers are saved in browser storage per strategy and symbol until the backend persists shapes.
+            Saved through the backend per strategy and instrument, and shown on every timeframe.
           </p>
           <div className="mt-4 space-y-2">
-            {shapes.length === 0 ? (
-              <p className="app-muted text-sm">No shapes drawn yet. Click Draw marker, then click the chart.</p>
+            {drawingState.drawings.length === 0 ? (
+              <p className="app-muted text-sm">No drawings yet. Pick a tool from the left ribbon, then click the chart.</p>
             ) : (
-              shapes.map((shape) => (
-                <div key={shape.id} className="app-shape-row">
-                  <span>{shape.label}</span>
-                  <span className="app-muted">{String(shape.time)}</span>
+              drawingState.drawings.map((drawing) => (
+                <div key={drawing.id} className="app-shape-row" data-selected={drawing.id === drawingState.selectedId || undefined}>
+                  <button type="button" className="flex-1 text-left" onClick={() => drawings.select(drawing.id)}>
+                    {TOOL_LABELS[drawing.tool]}
+                  </button>
+                  <span className="app-muted">{new Date(drawing.time * 1000).toISOString().slice(0, 16).replace('T', ' ')} UTC</span>
+                  <button type="button" className="app-muted" aria-label={`Remove ${TOOL_LABELS[drawing.tool]}`} onClick={() => drawings.remove(drawing.id)}>
+                    <Trash2 className="size-4" aria-hidden="true" />
+                  </button>
                 </div>
               ))
             )}
           </div>
         </div>
       </div>
+
+      <DrawingSettingsDialog controller={drawings} />
 
       {isCustomEditorOpen && (
         <div className="app-python-editor">
@@ -361,34 +344,6 @@ export function CandlestickWorkbench({ strategyId, symbol }: CandlestickWorkbenc
       )}
     </div>
   )
-}
-
-function readPersistedShapes(strategyId: string, symbol: string): ChartShape[] {
-  try {
-    const raw = localStorage.getItem(shapeStorageKey(strategyId, symbol))
-    if (!raw) {
-      return []
-    }
-
-    const parsed = JSON.parse(raw) as ChartShape[]
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
-}
-
-function shapeStorageKey(strategyId: string, symbol: string) {
-  return `nika-chart-shapes:${strategyId}:${symbol}`
-}
-
-function shapeToMarker(shape: ChartShape): SeriesMarker<Time> {
-  return {
-    time: shape.time,
-    position: 'aboveBar',
-    color: shape.color,
-    shape: 'circle',
-    text: shape.label,
-  }
 }
 
 function calculateIndicator(name: string, candles: Candle[]) {
@@ -456,51 +411,4 @@ function calculateRsi(candles: Candle[], period: number) {
       return { time: candle.time, value }
     })
     .filter((item): item is { time: Time; value: number } => item !== null)
-}
-
-function generatePlaceholderCandles(symbol: string, timeframe: string): Candle[] {
-  const seed = Array.from(symbol + timeframe).reduce((sum, char) => sum + char.charCodeAt(0), 0)
-  const now = Math.floor(Date.now() / 1000)
-  const step = timeframeToSeconds(timeframe)
-  const candles: Candle[] = []
-  let close = 100 + (seed % 80)
-
-  for (let index = 160; index >= 0; index -= 1) {
-    const time = (now - index * step) as Time
-    const wave = Math.sin((160 - index + seed) / 7) * 2.2
-    const drift = Math.cos((160 - index) / 13) * 1.1
-    const open = close
-    close = Math.max(1, close + wave + drift + ((index + seed) % 5 - 2) * 0.18)
-    const high = Math.max(open, close) + 1.2 + ((index + seed) % 4) * 0.25
-    const low = Math.min(open, close) - 1.2 - ((index + seed) % 3) * 0.2
-
-    candles.push({
-      time,
-      open: roundPrice(open),
-      high: roundPrice(high),
-      low: roundPrice(low),
-      close: roundPrice(close),
-    })
-  }
-
-  return candles
-}
-
-function timeframeToSeconds(timeframe: string) {
-  const unit = timeframe.at(-1)
-  const value = Number(timeframe.slice(0, -1))
-
-  if (unit === 'm') {
-    return value * 60
-  }
-
-  if (unit === 'h') {
-    return value * 60 * 60
-  }
-
-  return value * 24 * 60 * 60
-}
-
-function roundPrice(value: number) {
-  return Math.round(value * 100) / 100
 }

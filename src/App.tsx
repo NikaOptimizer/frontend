@@ -1,9 +1,21 @@
-import { useMemo, useState } from 'react'
-import { Activity, BarChart3, CandlestickChart, Plus, Sparkles } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Bug, Activity, BarChart3, CandlestickChart, Plus, Sparkles } from 'lucide-react'
 
+import { DebugDashboard } from '@/components/debug-dashboard'
 import { CandlestickWorkbench } from '@/components/chart/candlestick-workbench'
 import { AppLayout } from '@/components/layout/app-layout'
 import { Button } from '@/components/ui/button'
+
+type Instrument = {
+  instrument_id: string
+  provider: string
+  venue: string
+  candle_count: number
+  first_ts: string
+  last_ts: string
+}
+
+const instrumentKey = (item: Instrument) => `${item.provider}:${item.instrument_id}`
 
 type StrategyVersion = {
   label: string
@@ -50,9 +62,37 @@ const placeholderStrategies: Strategy[] = [
 const periods = ['1D', '1W', '1M', '3M', '1Y']
 
 function App() {
+  const [debugOpen, setDebugOpen] = useState(false)
   const [strategies, setStrategies] = useState(placeholderStrategies)
   const [selectedStrategyId, setSelectedStrategyId] = useState<string | null>(null)
-  const [selectedSymbol, setSelectedSymbol] = useState('BTCUSDT')
+  const [instruments, setInstruments] = useState<Instrument[]>([])
+  const [selectedInstrumentKey, setSelectedInstrumentKey] = useState('')
+  const [instrumentError, setInstrumentError] = useState('')
+  const [instrumentRefresh, setInstrumentRefresh] = useState(0)
+  const [instrumentsLoading, setInstrumentsLoading] = useState(true)
+  const selectedInstrument = instruments.find((item) => instrumentKey(item) === selectedInstrumentKey) ?? instruments[0]
+  const selectedSymbol = selectedInstrument?.instrument_id ?? ''
+
+  useEffect(() => {
+    const controller = new AbortController()
+    async function loadInstruments() {
+      setInstrumentsLoading(true)
+      setInstrumentError('')
+      try {
+        const response = await fetch('/api/instruments/', { signal: controller.signal })
+        if (!response.ok) throw new Error('Unable to load available instruments. Please retry.')
+        const payload = await response.json() as { instruments: Instrument[] }
+        if (!Array.isArray(payload.instruments)) throw new Error('Invalid instrument response.')
+        if (!controller.signal.aborted) setInstruments(payload.instruments)
+      } catch (error) {
+        if (!controller.signal.aborted) setInstrumentError(error instanceof Error ? error.message : 'Unable to load instruments.')
+      } finally {
+        if (!controller.signal.aborted) setInstrumentsLoading(false)
+      }
+    }
+    void loadInstruments()
+    return () => controller.abort()
+  }, [instrumentRefresh])
   const [selectedPeriod, setSelectedPeriod] = useState('1M')
 
   const selectedStrategy = useMemo(
@@ -77,27 +117,29 @@ function App() {
 
     setStrategies((currentStrategies) => [...currentStrategies, strategy])
     setSelectedStrategyId(strategy.id)
-    setSelectedSymbol(strategy.symbols[0])
     setSelectedPeriod('1M')
   }
 
   function openStrategy(strategy: Strategy) {
     setSelectedStrategyId(strategy.id)
-    setSelectedSymbol(strategy.symbols[0])
     setSelectedPeriod('1M')
   }
+
+  const debugButton = <Button className="app-secondary-button" onClick={() => setDebugOpen(true)}><Bug aria-hidden="true" />Debug</Button>
+  if (debugOpen) return <DebugDashboard onHome={() => { setDebugOpen(false); setSelectedStrategyId(null) }} />
 
   if (selectedStrategy) {
     return (
       <AppLayout
         pageTitle={selectedStrategy.name}
         onHome={() => setSelectedStrategyId(null)}
-        action={
+        action={<>
+          {debugButton}
           <Button onClick={addPlaceholderStrategy} className="app-primary-button">
             <Plus aria-hidden="true" />
             Add strategy
           </Button>
-        }
+        </>}
       >
         <main className="space-y-6">
           <section className="app-panel p-6 md:p-8">
@@ -160,25 +202,27 @@ function App() {
               </div>
 
               <div className="mt-6 grid gap-4 md:grid-cols-2">
-                <label className="app-field-label">
+                <label className="app-field-label min-w-0">
                   Symbol
                   <select
-                    value={selectedSymbol}
-                    onChange={(event) => setSelectedSymbol(event.target.value)}
-                    className="app-select"
+                    value={selectedInstrument ? instrumentKey(selectedInstrument) : ""}
+                    disabled={instrumentsLoading || instruments.length === 0}
+                    onChange={(event) => setSelectedInstrumentKey(event.target.value)}
+                    className="app-select min-w-0 max-w-full"
                   >
-                    {selectedStrategy.symbols.map((symbol) => (
-                      <option key={symbol} value={symbol}>{symbol}</option>
+                    {instruments.length === 0 && <option value="">{instrumentsLoading ? 'Loading instruments...' : 'No candle data available'}</option>}
+                    {instruments.map((item) => (
+                      <option key={instrumentKey(item)} value={instrumentKey(item)}>{item.venue} · {item.instrument_id} · {item.provider}</option>
                     ))}
                   </select>
                 </label>
 
-                <label className="app-field-label">
+                <label className="app-field-label min-w-0">
                   Period
                   <select
                     value={selectedPeriod}
                     onChange={(event) => setSelectedPeriod(event.target.value)}
-                    className="app-select"
+                    className="app-select min-w-0 max-w-full"
                   >
                     {periods.map((period) => (
                       <option key={period} value={period}>{period}</option>
@@ -187,6 +231,10 @@ function App() {
                 </label>
               </div>
 
+              <p className="mt-3 text-sm text-slate-300" role="status">
+                {instrumentError || (selectedInstrument ? `Available: ${selectedInstrument.first_ts.slice(0, 10)} – ${selectedInstrument.last_ts.slice(0, 10)}. Period ends at the latest stored candle.` : 'Waiting for imported candles.')}
+              </p>
+              <Button type="button" variant="outline" className="app-secondary-button mt-2" onClick={() => setInstrumentRefresh((value) => value + 1)} disabled={instrumentsLoading}>Refresh instruments</Button>
               <div className="app-test-summary mt-5">
                 <p className="text-sm text-white">
                   Ready to run a placeholder test for <strong>{selectedSymbol}</strong> over <strong>{selectedPeriod}</strong>.
@@ -207,7 +255,7 @@ function App() {
               </div>
             </div>
 
-            <CandlestickWorkbench key={`${selectedStrategy.id}:${selectedSymbol}`} strategyId={selectedStrategy.id} symbol={selectedSymbol} />
+            {selectedInstrument && <CandlestickWorkbench key={`${selectedStrategy.id}:${instrumentKey(selectedInstrument)}`} strategyId={selectedStrategy.id} symbol={selectedSymbol} provider={selectedInstrument.provider} period={selectedPeriod} />}
           </section>
         </main>
       </AppLayout>
@@ -217,12 +265,13 @@ function App() {
   return (
     <AppLayout
       pageTitle="Nika Optimizer"
-      action={
+      action={<>
+        {debugButton}
         <Button onClick={addPlaceholderStrategy} className="app-primary-button">
           <Plus aria-hidden="true" />
           Add strategy
         </Button>
-      }
+      </>}
     >
       <main className="space-y-8">
         <section className="app-hero app-panel p-6 md:p-10">
@@ -238,9 +287,9 @@ function App() {
 
           <div className="app-hero-card">
             <Sparkles className="size-6 text-amber-300" aria-hidden="true" />
-            <p className="mt-4 text-sm font-medium text-white">Backend bridge pending</p>
+            <p className="mt-4 text-sm font-medium text-white">Candle bridge connected</p>
             <p className="app-muted mt-2 text-sm leading-6">
-              These strategies are local placeholders until the Django API provides strategy metadata, runs, reports, and live data.
+              Candle charts load through Django. Strategies, runs, and reports remain local placeholders; inspect real datasets from Debug.
             </p>
           </div>
         </section>
